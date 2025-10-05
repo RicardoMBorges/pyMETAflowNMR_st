@@ -1090,7 +1090,6 @@ which_stage = st.radio(
 
 qc_df = _pick_stage(which_stage)
 
-"""
 if not isinstance(qc_df, pd.DataFrame) or qc_df.empty:
     st.info("Nothing to inspect yet. Run transform/normalization/scaling first.")
 else:
@@ -1125,7 +1124,7 @@ else:
         fig = px.scatter(fstats, x=axis_col, y="Std", title="Feature standard deviation vs ppm")
         fig.update_xaxes(autorange="reversed")  # NMR look
         st.plotly_chart(fig, use_container_width=True)
-"""
+
 
 # ------------------ STOCSY (ppm axis) ----------------------------------
 st.markdown("---")
@@ -1506,4 +1505,149 @@ else:
         mime="application/zip"
     )
 
-st.caption("© pyMETAflow NMR — Ricardo M. Borges / LAABio-IPPN-UFRJ")
+# ------------------ Export (MetaboAnalyst) ---------------------------------------
+st.markdown("---")
+st.subheader("Export to MetaboAnalyst")
+
+import time  # for default filename timestamps
+
+# 1) pick which matrix to export (prefer fully processed)
+export_source = coalesce_df(
+    normalized_df,                    # scaled (post-scaling)        ← recommended
+    df_aligned,                       # aligned
+    st.session_state.get("nmr_final_df"),  # post-reference, post-clip
+    referenced_df,
+    processed0,
+    combined
+)
+
+if not isinstance(export_source, pd.DataFrame) or export_source.empty:
+    st.info("No matrix available to export yet.")
+elif meta_df is None or meta_df.empty:
+    st.warning("Load metadata (.csv) to include class labels for MetaboAnalyst.")
+else:
+    # 2) suggest the metadata column that matches the current sample column names
+    axis_col = "Chemical Shift (ppm)"
+    sample_cols = [c for c in export_source.columns if c != axis_col]
+
+    def _san(s: str) -> str:
+        # must mirror sanitize_string() used in data_processing_NMR.py
+        return re.sub(r'[^a-zA-Z0-9_]', '', str(s))
+
+    samples_sanit = {_san(c) for c in sample_cols}
+
+    # Guess sample-id column by maximum sanitized overlap
+    guess_id, best_hits = None, -1
+    for col in meta_df.columns:
+        vals = {_san(v) for v in meta_df[col].astype(str)}
+        hits = len(samples_sanit & vals)
+        if hits > best_hits:
+            best_hits, guess_id = hits, col
+
+    # Guess class column by name (class/group/condition/phenotype…), with your default as backup
+    guess_class = None
+    for key in ("class", "group", "condition", "phenotype"):
+        cands = [c for c in meta_df.columns if key in c.lower()]
+        if cands:
+            guess_class = cands[0]
+            break
+    if guess_class is None and "ATTRIBUTE_classification" in meta_df.columns:
+        guess_class = "ATTRIBUTE_classification"
+    if guess_class is None:
+        guess_class = meta_df.columns[-1]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        sample_id_col = st.selectbox(
+            "Metadata column that matches sample columns",
+            options=meta_df.columns.tolist(),
+            index=(meta_df.columns.tolist().index(guess_id) if guess_id in meta_df.columns else 0),
+            help="This column’s values should match your sample column names (after sanitization)."
+        )
+    with c2:
+        class_col = st.selectbox(
+            "Metadata class/phenotype column",
+            options=meta_df.columns.tolist(),
+            index=(meta_df.columns.tolist().index(guess_class) if guess_class in meta_df.columns else 0)
+        )
+
+    # Overlap preview
+    meta_ids_sanit = meta_df[sample_id_col].astype(str).map(_san)
+    overlap = len(samples_sanit & set(meta_ids_sanit))
+    st.caption(f"Matched **{overlap}/{len(sample_cols)}** samples after sanitization.")
+
+    # Optional preview of missing samples
+    missing = sorted(list(samples_sanit - set(meta_ids_sanit)))
+    if missing:
+        with st.expander("Samples missing metadata (will be excluded)"):
+            show_df(pd.DataFrame({"missing_sample_id_after_sanitize": missing}))
+
+    # Output filename
+    default_name = f"metaboanalyst_input_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    out_name = st.text_input("Output filename", value=default_name)
+
+    # 3) Build & download
+    build_btn = st.button("Build MetaboAnalyst CSV")
+    if build_btn:
+        try:
+            if hasattr(nmr, "export_metaboanalyst"):
+                # Write to a local file (function returns the feature×samples table used)
+                out_path = Path(out_name).name  # keep it simple (no dirs)
+                _ = nmr.export_metaboanalyst(
+                    export_source,
+                    meta_df,
+                    sample_id_col=sample_id_col,
+                    class_col=class_col,
+                    output_file=out_path
+                )
+                with open(out_path, "rb") as fh:
+                    csv_bytes = fh.read()
+            else:
+                # Fallback: in-memory reimplementation (returns CSV bytes)
+                import csv
+                orig_cols = list(export_source.columns)
+                san_cols  = [orig_cols[0]] + [_san(s) for s in orig_cols[1:]]
+                df_al = export_source.copy()
+                df_al.columns = san_cols
+                sample_cols_san = san_cols[1:]
+
+                meta2 = meta_df.copy()
+                meta2[sample_id_col] = meta2[sample_id_col].map(_san)
+                meta2[class_col]     = meta2[class_col].map(_san)
+                meta_idx = meta2.set_index(sample_id_col)
+                cls_series = meta_idx.reindex(sample_cols_san)[class_col]
+                valid = cls_series.dropna().index.tolist()
+
+                new_df = df_al[[axis_col] + valid].copy()
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(new_df.columns.tolist())
+                w.writerow([""] + cls_series.loc[valid].tolist())
+                for i in range(len(new_df)):
+                    w.writerow(new_df.iloc[i].values)
+                csv_bytes = buf.getvalue().encode("utf-8")
+
+            st.success(f"MetaboAnalyst CSV built ({overlap} samples with class labels).")
+            st.download_button(
+                "⬇️ Download MetaboAnalyst CSV",
+                data=csv_bytes,
+                file_name=out_name,
+                mime="text/csv"
+            )
+
+            # Tiny preview (first few lines; MetaboAnalyst expects first row = header, second row = class)
+            try:
+                prev = pd.read_csv(io.BytesIO(csv_bytes), header=None, nrows=6)
+                st.caption("Preview (first rows):")
+                st.dataframe(prev, use_container_width=True)
+            except Exception:
+                pass
+
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+
+
+
+
+st.caption("© pyMETAflow for NMR — Ricardo M. Borges / LAABio-IPPN-UFRJ")
